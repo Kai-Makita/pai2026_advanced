@@ -21,10 +21,18 @@ robot:
   position_kv: 10
   joint_force_limits: [18, 16, 12, 8]
   finger_force: 18
-  finger_base_offset: 0.034
+  finger_position_kp: 500
+  finger_friction: 3.0
+  finger_base_offset: 0.024
+  finger_pad_forward_offset: 0.080
+  finger_pad_half_length: 0.040
   finger_pad_half_width: 0.009
+  finger_pad_half_height: 0.035
+  finger_pad_vertical_offset: -0.020
   base_max_linear_velocity: 0.6
   base_max_angular_velocity: 1.5
+  base_max_linear_acceleration: 0.15
+  base_max_angular_acceleration: 0.20
   joint_delta_rad: 0.06
 task:
   pick_table_xy: [0.75, 0.0]
@@ -38,7 +46,7 @@ task:
   position_tolerance: 0.055
   yaw_tolerance_deg: 8
   grasp_mode: physical
-  phase_timeouts: {NAVIGATE_TO_PICK: 15, REACH: 8, GRASP: 4, LIFT: 6, NAVIGATE_TO_PLACE: 18, PLACE: 9}
+  phase_timeouts: {NAVIGATE_TO_PICK: 15, REACH: 8, GRASP: 4, LIFT: 8, NAVIGATE_TO_PLACE: 30, PLACE: 9}
 randomization:
   train: {base_xy: 0.15, base_yaw_deg: 15, object_xy: 0.05, target_xy: 0.05}
   ood: {base_xy: 0.25, base_yaw_deg: 25, object_xy: 0.08, target_xy: 0.08}
@@ -56,9 +64,22 @@ teacher:
   base_k_rho: 1.4
   base_k_alpha: 2.0
   base_k_yaw: 1.2
+  transport_linear_scale: 0.15
+  transport_angular_scale: 0.05
   ik_damping: 0.02
   ik_gain: 4.0
   ik_tolerance: 0.025
+  ik_pitch_weight: 1.0
+  grasp_approach_seconds: 1.5
+  gripper_close_seconds: 1.0
+  grasp_settle_steps: 5
+  contact_persistence_steps: 4
+  lift_seconds: 2.0
+  lift_height: 0.14
+  lift_retract_seconds: 2.0
+  lift_retract_distance: 0.20
+  grasp_pitch_rad: 0.30
+  grasp_pitch_tolerance_rad: 0.08
 learning:
   bc: {learning_rate: 0.0003, batch_size: 256, epochs: 100, phase_balancing: true}
   ppo: {learning_rate: 0.0003, gamma: 0.99, gae_lambda: 0.95, clip_range: 0.2, n_envs: 8, n_steps: 2048, batch_size: 64, total_timesteps: 100000, log_std_init: -1.0, pre_finetune_eval_episodes: 20}
