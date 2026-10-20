@@ -1,0 +1,65 @@
+seed: 42
+simulation:
+  physics_hz: 500
+  control_hz: 20
+  episode_seconds: 45
+  render_width: 960
+  render_height: 540
+robot:
+  chassis_size: [0.35, 0.30, 0.18]
+  chassis_mass: 8.0
+  wheel_radius: 0.075
+  wheel_width: 0.035
+  track_width: 0.28
+  wheel_mass: 0.35
+  arm_link_lengths: [0.18, 0.16, 0.10]
+  arm_link_masses: [0.65, 0.50, 0.30]
+  joint_ranges_deg: [[-170, 170], [-80, 80], [-115, 115], [-120, 120]]
+  joint_damping: [1.5, 1.2, 0.9, 0.5]
+  joint_armature: 0.05
+  position_kp: 60
+  position_kv: 10
+  joint_force_limits: [18, 16, 12, 8]
+  finger_force: 18
+  finger_base_offset: 0.034
+  finger_pad_half_width: 0.009
+  base_max_linear_velocity: 0.6
+  base_max_angular_velocity: 1.5
+  joint_delta_rad: 0.06
+task:
+  pick_table_xy: [0.75, 0.0]
+  place_table_xy: [-0.55, 0.75]
+  table_size: [0.55, 0.55, 0.40]
+  object_size: [0.035, 0.035, 0.05]
+  object_mass: 0.12
+  pick_xy: [0.72, 0.0]
+  place_xy: [-0.52, 0.75]
+  stand_off: 0.43
+  position_tolerance: 0.055
+  yaw_tolerance_deg: 8
+  grasp_mode: physical
+  phase_timeouts: {NAVIGATE_TO_PICK: 15, REACH: 8, GRASP: 4, LIFT: 6, NAVIGATE_TO_PLACE: 18, PLACE: 9}
+randomization:
+  train: {base_xy: 0.15, base_yaw_deg: 15, object_xy: 0.05, target_xy: 0.05}
+  ood: {base_xy: 0.25, base_yaw_deg: 25, object_xy: 0.08, target_xy: 0.08}
+  object_mass_scale: [1.0, 1.0]
+  friction_scale: [1.0, 1.0]
+reward:
+  progress: 1.0
+  phase_completion: 2.0
+  task_success: 20.0
+  object_drop: 10.0
+  time_penalty: 0.005
+  action_smoothness: 0.001
+  potential_based: true
+teacher:
+  base_k_rho: 1.4
+  base_k_alpha: 2.0
+  base_k_yaw: 1.2
+  ik_damping: 0.02
+  ik_gain: 4.0
+  ik_tolerance: 0.025
+learning:
+  bc: {learning_rate: 0.0003, batch_size: 256, epochs: 100, phase_balancing: true}
+  ppo: {learning_rate: 0.0003, gamma: 0.99, gae_lambda: 0.95, clip_range: 0.2, n_envs: 8, n_steps: 2048, batch_size: 64, total_timesteps: 100000, log_std_init: -1.0, pre_finetune_eval_episodes: 20}
+
