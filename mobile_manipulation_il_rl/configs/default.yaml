@@ -29,6 +29,7 @@ robot:
   finger_pad_half_width: 0.009
   finger_pad_half_height: 0.035
   finger_pad_vertical_offset: -0.020
+  finger_pad_wedge_rad: 0.0
   base_max_linear_velocity: 0.6
   base_max_angular_velocity: 1.5
   base_max_linear_acceleration: 0.15
@@ -45,6 +46,10 @@ task:
   stand_off: 0.43
   position_tolerance: 0.055
   yaw_tolerance_deg: 8
+  stop_linear_velocity: 0.015
+  stop_angular_velocity: 0.035
+  navigation_settle_seconds: 0.30
+  navigation_braking_margin: 0.04
   grasp_mode: physical
   phase_timeouts: {NAVIGATE_TO_PICK: 15, REACH: 8, GRASP: 4, LIFT: 8, NAVIGATE_TO_PLACE: 30, PLACE: 9}
 randomization:
@@ -76,8 +81,12 @@ teacher:
   contact_persistence_steps: 4
   lift_seconds: 2.0
   lift_height: 0.14
-  lift_retract_seconds: 2.0
-  lift_retract_distance: 0.20
+  lift_retract_seconds: 0.75
+  lift_retract_distance: 0.05
+  hold_seconds: 0.45
+  hold_timeout_seconds: 2.0
+  hold_relative_speed: 0.015
+  hold_relative_drift: 0.012
   grasp_pitch_rad: 0.30
   grasp_pitch_tolerance_rad: 0.08
 learning:

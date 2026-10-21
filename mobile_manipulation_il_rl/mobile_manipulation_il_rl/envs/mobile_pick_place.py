@@ -57,6 +57,14 @@ class MobilePickPlaceEnv(gym.Env):
         self._gripper_target = 0.035
         self._reward_sums: dict[str, float] = {}
         self._commanded_twist = (0.0, 0.0)
+        self._base_acceleration = (0.0, 0.0)
+        self._nav_stable_time = 0.0
+        self._hold_active = False
+        self._hold_stable_time = 0.0
+        self._hold_start_time = 0.0
+        self._hold_reference = np.zeros(3)
+        self._previous_relative = np.zeros(3)
+        self._first_object_contact: dict | None = None
         self._cache_ids()
 
     def _cache_ids(self) -> None:
@@ -72,6 +80,9 @@ class MobilePickPlaceEnv(gym.Env):
         self.right_geom = mujoco.mj_name2id(m, mujoco.mjtObj.mjOBJ_GEOM, "finger_right_geom")
         self.obj_geom = mujoco.mj_name2id(m, mujoco.mjtObj.mjOBJ_GEOM, "object_geom")
         self.eq_assist = mujoco.mj_name2id(m, mujoco.mjtObj.mjOBJ_EQUALITY, "assist_grasp")
+        self.chassis_geom = mujoco.mj_name2id(m, mujoco.mjtObj.mjOBJ_GEOM, "chassis")
+        self.table_geoms = [mujoco.mj_name2id(m, mujoco.mjtObj.mjOBJ_GEOM, name)
+                            for name in ("pick_table_geom", "place_table_geom")]
         debug_body = mujoco.mj_name2id(m, mujoco.mjtObj.mjOBJ_BODY, "debug_target")
         self.debug_target_mocap = int(m.body_mocapid[debug_body])
 
@@ -116,11 +127,32 @@ class MobilePickPlaceEnv(gym.Env):
             if side and self.obj_geom in pair:
                 force = np.zeros(6)
                 mujoco.mj_contactForce(self.model, self.data, i, force)
-                world_force = force[:3] @ np.asarray(con.frame).reshape(3, 3)
+                frame = np.asarray(con.frame).reshape(3, 3)
+                world_force = force[:3] @ frame
+                relative_velocity = self._contact_relative_velocity(con)
+                normal = frame[0].copy()
+                tangential_velocity = relative_velocity - normal * np.dot(relative_velocity, normal)
+                mu = float(con.friction[0])
+                tangential_force = float(np.linalg.norm(force[1:3]))
                 rows.append({"side": side, "position": con.pos.tolist(), "distance": float(con.dist),
                              "normal_force": float(force[0]), "force6": force.tolist(),
-                             "world_force": world_force.tolist()})
+                             "world_force": world_force.tolist(), "normal_world": normal.tolist(),
+                             "relative_velocity_world": relative_velocity.tolist(),
+                             "tangential_speed": float(np.linalg.norm(tangential_velocity)),
+                             "friction_coefficient": mu, "tangential_force": tangential_force,
+                             "friction_margin": float(mu * force[0] - tangential_force),
+                             "friction_model": "elliptic_cone_coulomb_approximation"})
         return rows
+
+    def _body_point_velocity(self, body_id: int, point: np.ndarray) -> np.ndarray:
+        velocity = np.zeros(6)
+        mujoco.mj_objectVelocity(self.model, self.data, mujoco.mjtObj.mjOBJ_BODY, body_id, velocity, 0)
+        return velocity[3:6] + np.cross(velocity[:3], point - self.data.xpos[body_id])
+
+    def _contact_relative_velocity(self, con) -> np.ndarray:
+        body1 = int(self.model.geom_bodyid[con.geom1])
+        body2 = int(self.model.geom_bodyid[con.geom2])
+        return self._body_point_velocity(body2, con.pos) - self._body_point_velocity(body1, con.pos)
 
     def object_contact_diagnostics(self) -> list[dict]:
         rows = []
@@ -131,18 +163,37 @@ class MobilePickPlaceEnv(gym.Env):
             other = con.geom2 if con.geom1 == self.obj_geom else con.geom1
             force = np.zeros(6); mujoco.mj_contactForce(self.model, self.data, i, force)
             body_id = int(self.model.geom_bodyid[other])
+            frame = np.asarray(con.frame).reshape(3, 3)
             rows.append({"other_geom": mujoco.mj_id2name(self.model, mujoco.mjtObj.mjOBJ_GEOM, other),
                          "other_body": mujoco.mj_id2name(self.model, mujoco.mjtObj.mjOBJ_BODY, body_id),
-                         "position": con.pos.tolist(), "distance": float(con.dist), "normal_force": float(force[0])})
+                         "position": con.pos.tolist(), "distance": float(con.dist), "normal_force": float(force[0]),
+                         "normal_world": frame[0].tolist(), "force6": force.tolist()})
         return rows
+
+    def _base_table_clearance(self) -> float:
+        base, yaw = self._base_pose()
+        half = np.asarray(self.cfg["robot"]["chassis_size"][:2]) / 2
+        projected = np.array([abs(math.cos(yaw)) * half[0] + abs(math.sin(yaw)) * half[1],
+                              abs(math.sin(yaw)) * half[0] + abs(math.cos(yaw)) * half[1]])
+        table_half = np.asarray(self.cfg["task"]["table_size"][:2]) / 2
+        gaps = []
+        for key in ("pick_table_xy", "place_table_xy"):
+            separation = np.abs(base[:2] - np.asarray(self.cfg["task"][key])) - projected - table_half
+            gaps.append(float(max(separation)))
+        return min(gaps)
 
     def diagnostic_state(self, teacher=None) -> dict:
         q = np.array([self._qpos(j) for j in self.arm_joints])
         ranges = self.model.jnt_range[self.arm_joints]
         margins = np.minimum(q - ranges[:, 0], ranges[:, 1] - q)
         obj, ee = self._object_pos(), self._ee_pos()
+        base, yaw = self._base_pose()
+        nav_target = self._nav_target()
+        desired_yaw = math.atan2(self._episode_targets["active_xy"][1] - base[1],
+                                 self._episode_targets["active_xy"][0] - base[0])
         od = self.model.jnt_dofadr[self.obj_joint]
         contacts = self.contact_diagnostics()
+        pad_center = 0.5 * (self.data.geom_xpos[self.left_geom] + self.data.geom_xpos[self.right_geom])
         return {
             "time_s": self._step_count * self.dt, "phase": self.fsm.phase.name,
             "phase_time_s": self.fsm.phase_time, "ee_position": ee.tolist(),
@@ -159,6 +210,18 @@ class MobilePickPlaceEnv(gym.Env):
             "right_contact": any(x["side"] == "right" for x in contacts),
             "left_finger_position": self.data.geom_xpos[self.left_geom].tolist(),
             "right_finger_position": self.data.geom_xpos[self.right_geom].tolist(),
+            "pad_center_error": (pad_center - obj).tolist(),
+            "base_position": base.tolist(), "base_yaw": yaw,
+            "base_linear_velocity": float(self._commanded_twist[0]),
+            "base_angular_velocity": float(self._commanded_twist[1]),
+            "base_linear_acceleration": float(self._base_acceleration[0]),
+            "base_angular_acceleration": float(self._base_acceleration[1]),
+            "navigation_position_error": float(np.linalg.norm(nav_target - base[:2])),
+            "navigation_yaw_error": float(wrap_angle(desired_yaw - yaw)),
+            "navigation_settle_time": self._nav_stable_time,
+            "base_table_clearance": self._base_table_clearance(),
+            "first_object_contact": copy.deepcopy(self._first_object_contact),
+            "hold_active": self._hold_active, "hold_stable_time": self._hold_stable_time,
             "gripper_opening": self._gripper_aperture(),
             "gripper_target_opening": float(2 * self._gripper_target + 2 *
                 (self.cfg["robot"]["finger_base_offset"] - self.cfg["robot"]["finger_pad_half_width"])),
@@ -173,7 +236,8 @@ class MobilePickPlaceEnv(gym.Env):
         # Stop on the table-facing side; heading points from base to target.
         table = np.asarray(self.cfg["task"][key], dtype=float)
         direction = table / max(np.linalg.norm(table), 1e-6)
-        return target - direction * self.cfg["task"]["stand_off"]
+        return target - direction * (self.cfg["task"]["stand_off"] +
+                                     self.cfg["task"]["navigation_braking_margin"])
 
     def _observe(self) -> np.ndarray:
         base, yaw = self._base_pose()
@@ -213,6 +277,11 @@ class MobilePickPlaceEnv(gym.Env):
         self._step_count = 0
         self._last_action.fill(0)
         self._commanded_twist = (0.0, 0.0)
+        self._base_acceleration = (0.0, 0.0)
+        self._nav_stable_time = 0.0
+        self._hold_active = False; self._hold_stable_time = 0.0; self._hold_start_time = 0.0
+        self._hold_reference.fill(0); self._previous_relative.fill(0)
+        self._first_object_contact = None
         self._reward_sums = {k: 0.0 for k in ("progress", "phase_completion", "task_success", "time", "smoothness", "failure")}
         mode = (options or {}).get("randomization", self.evaluation_mode)
         rnd = ({"base_xy": 0, "base_yaw_deg": 0, "object_xy": 0, "target_xy": 0}
@@ -228,7 +297,9 @@ class MobilePickPlaceEnv(gym.Env):
         self.data.qpos[oq + 3:oq + 7] = [1, 0, 0, 0]
         # Elbow-up hold pose: compact enough for navigation and outside the
         # downward local minimum of position-only IK.
-        home = np.array([0, -0.80, -0.70, 0.80])
+        # Fold the forearm above the chassis for navigation. The previous pose
+        # extended link3 into the object before the base had stopped.
+        home = np.array([0, -1.00, -0.30, 0.80])
         for joint, value in zip(self.arm_joints, home):
             self.data.qpos[self.model.jnt_qposadr[joint]] = value
         self._joint_targets = home.copy()
@@ -271,6 +342,7 @@ class MobilePickPlaceEnv(gym.Env):
         omega = previous_omega + np.clip(requested_omega - previous_omega,
                                          -r["base_max_angular_acceleration"] * self.dt,
                                          r["base_max_angular_acceleration"] * self.dt)
+        self._base_acceleration = ((v - previous_v) / self.dt, (omega - previous_omega) / self.dt)
         self._commanded_twist = (float(v), float(omega))
         self.data.ctrl[0] = (v - omega * r["track_width"] / 2) / r["wheel_radius"]
         self.data.ctrl[1] = (v + omega * r["track_width"] / 2) / r["wheel_radius"]
@@ -309,8 +381,16 @@ class MobilePickPlaceEnv(gym.Env):
         desired_yaw = math.atan2(self._episode_targets["active_xy"][1] - base[1],
                                  self._episode_targets["active_xy"][0] - base[0])
         yaw_aligned = abs(wrap_angle(desired_yaw - yaw)) < math.radians(self.cfg["task"]["yaw_tolerance_deg"])
-        if self.fsm.phase in (Phase.NAVIGATE_TO_PICK, Phase.NAVIGATE_TO_PLACE) and nav_dist < self.cfg["task"]["position_tolerance"] and yaw_aligned:
-            self.fsm.advance("navigation_target_reached"); completed = True
+        if self.fsm.phase in (Phase.NAVIGATE_TO_PICK, Phase.NAVIGATE_TO_PLACE):
+            stopped = (abs(self._commanded_twist[0]) <= self.cfg["task"]["stop_linear_velocity"] and
+                       abs(self._commanded_twist[1]) <= self.cfg["task"]["stop_angular_velocity"])
+            if nav_dist < self.cfg["task"]["position_tolerance"] and yaw_aligned and stopped:
+                self._nav_stable_time += self.dt
+            else:
+                self._nav_stable_time = 0.0
+            if self._nav_stable_time >= self.cfg["task"]["navigation_settle_seconds"]:
+                self._nav_stable_time = 0.0
+                self.fsm.advance("navigation_stopped_and_settled"); completed = True
         elif self.fsm.phase == Phase.REACH:
             base = self._base_pose()[0]
             approach_xy = self._object_pos()[:2] - base[:2]
@@ -335,12 +415,34 @@ class MobilePickPlaceEnv(gym.Env):
             self._lost_grasp_steps = 0
             self._lift_target = self._object_pos() + np.array([0.0, 0.0, 0.18])
             self.fsm.advance("bilateral_contact"); completed = True
-        elif self.fsm.phase == Phase.LIFT and ((self._object_pos()[2] > table_z + 0.13 and
-            self.fsm.phase_time >= self.cfg["teacher"]["lift_seconds"] + self.cfg["teacher"]["lift_retract_seconds"]) or (
-            self.cfg["task"]["grasp_mode"] == "assisted" and self.fsm.phase_time > 1.0
-        )):
-            self._episode_targets["active_xy"] = self._episode_targets["place_xy"]
-            self.fsm.advance("object_lifted"); completed = True
+        elif self.fsm.phase == Phase.LIFT:
+            assisted_ready = self.cfg["task"]["grasp_mode"] == "assisted" and self.fsm.phase_time > 1.0
+            lift_ready = (self._object_pos()[2] > table_z + 0.13 and
+                          self.fsm.phase_time >= self.cfg["teacher"]["lift_seconds"] +
+                          self.cfg["teacher"]["lift_retract_seconds"])
+            if (lift_ready or assisted_ready) and not self._hold_active:
+                self._hold_active = True
+                self._hold_start_time = self.fsm.phase_time
+                self._hold_reference = self._object_pos() - self._ee_pos()
+                self._previous_relative = self._hold_reference.copy()
+                self._hold_stable_time = 0.0
+                self._joint_targets[:] = [self._qpos(j) for j in self.arm_joints]
+            if self._hold_active:
+                relative = self._object_pos() - self._ee_pos()
+                relative_speed = float(np.linalg.norm(relative - self._previous_relative) / self.dt)
+                drift = float(np.linalg.norm(relative - self._hold_reference))
+                current_bilateral = bool(contacts.all())
+                stable = (current_bilateral and relative_speed <= self.cfg["teacher"]["hold_relative_speed"] and
+                          drift <= self.cfg["teacher"]["hold_relative_drift"])
+                self._hold_stable_time = self._hold_stable_time + self.dt if stable else 0.0
+                self._previous_relative = relative.copy()
+                if self._hold_stable_time >= self.cfg["teacher"]["hold_seconds"]:
+                    self._hold_active = False
+                    self._episode_targets["active_xy"] = self._episode_targets["place_xy"]
+                    self.fsm.advance("physical_hold_stable"); completed = True
+                elif self.fsm.phase_time - self._hold_start_time > self.cfg["teacher"]["hold_timeout_seconds"]:
+                    reason = "contact" if not current_bilateral else "slip"
+                    self.fsm.fail(f"timeout:HOLD:{reason}")
         elif self.fsm.phase == Phase.PLACE:
             d = np.linalg.norm(self._object_pos()[:2] - self._episode_targets["place_xy"])
             opened = self._qpos(self.finger_joints[0]) > 0.025
@@ -370,6 +472,8 @@ class MobilePickPlaceEnv(gym.Env):
         return float(np.linalg.norm(self._ee_pos() - target))
 
     def step(self, action):
+        object_before = self._object_pos().copy()
+        object_velocity_before = self.data.qvel[self.model.jnt_dofadr[self.obj_joint]:][:6].copy()
         action = self._mask_action(action)
         before_phase = self.fsm.phase
         self._apply_action(action)
@@ -400,6 +504,22 @@ class MobilePickPlaceEnv(gym.Env):
         self.data.qpos[qadr + 3:qadr + 7] = [math.cos(commanded_yaw / 2), 0, 0, math.sin(commanded_yaw / 2)]
         self.data.qvel[dadr:dadr + 6] = [v * math.cos(commanded_yaw), v * math.sin(commanded_yaw), 0, 0, 0, omega]
         mujoco.mj_forward(self.model, self.data)
+        if self._first_object_contact is None:
+            ignored = {"pick_table", "place_table"}
+            contact = next((row for row in self.object_contact_diagnostics()
+                            if row["other_body"] not in ignored), None)
+            if contact is not None:
+                od = self.model.jnt_dofadr[self.obj_joint]
+                self._first_object_contact = {
+                    "time_s": (self._step_count + 1) * self.dt,
+                    "phase": self.fsm.phase.name,
+                    "geom": contact["other_geom"], "body": contact["other_body"],
+                    "position": contact["position"],
+                    "object_position_before": object_before.tolist(),
+                    "object_position_after": self._object_pos().tolist(),
+                    "object_velocity_before": object_velocity_before.tolist(),
+                    "object_velocity_after": self.data.qvel[od:od + 6].tolist(),
+                }
         if self._carrying and self.cfg["task"]["grasp_mode"] == "assisted":
             # Explicit debug-only kinematic attachment. Physical mode never enters here.
             oq = self.model.jnt_qposadr[self.obj_joint]
@@ -447,8 +567,8 @@ class MobilePickPlaceEnv(gym.Env):
             return self._renderer.render()
         if self.render_mode == "human":
             if self._viewer is None:
-                import mujoco.viewer
-                self._viewer = mujoco.viewer.launch_passive(self.model, self.data)
+                import mujoco.viewer as mj_viewer
+                self._viewer = mj_viewer.launch_passive(self.model, self.data)
             self._viewer.sync()
         return None
 

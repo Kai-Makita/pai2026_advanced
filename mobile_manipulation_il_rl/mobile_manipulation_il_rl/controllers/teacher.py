@@ -24,11 +24,13 @@ class AnalyticTeacher:
         self._close_started_at = None
         self._lift_start = None
         self._lift_approach = None
+        self._retract_start = None
 
     def reset(self) -> None:
         self._last.fill(0)
         self._phase = None; self._grasp_start = None; self._grasp_target = None
         self._close_started_at = None; self._lift_start = None; self._lift_approach = None
+        self._retract_start = None
 
     def _base_action(self) -> np.ndarray:
         base, yaw = self.env._base_pose()
@@ -36,12 +38,20 @@ class AnalyticTeacher:
         rho = float(np.linalg.norm(delta))
         bearing = math.atan2(delta[1], delta[0])
         alpha = wrap_angle(bearing - yaw)
+        task = self.env.cfg["task"]
+        active = np.asarray(self.env._episode_targets["active_xy"], float)
+        final_heading_error = wrap_angle(math.atan2(active[1] - base[1], active[0] - base[0]) - yaw)
+        if rho < task["position_tolerance"]:
+            omega = 0.0 if abs(final_heading_error) < math.radians(task["yaw_tolerance_deg"]) else self.cfg["base_k_yaw"] * final_heading_error
+            r = self.env.cfg["robot"]
+            return np.clip(np.array([0.0, omega / r["base_max_angular_velocity"]], np.float32), -1, 1)
         v = self.cfg["base_k_rho"] * rho * max(0.0, math.cos(alpha))
         omega = self.cfg["base_k_alpha"] * alpha
         if rho < self.env.cfg["task"]["position_tolerance"] * 1.5:
             v *= rho / (self.env.cfg["task"]["position_tolerance"] * 1.5)
         r = self.env.cfg["robot"]
-        return np.array([v / r["base_max_linear_velocity"], omega / r["base_max_angular_velocity"]], np.float32)
+        return np.clip(np.array([v / r["base_max_linear_velocity"],
+                                 omega / r["base_max_angular_velocity"]], np.float32), -1, 1)
 
     def _ik_action(self, target: np.ndarray, target_pitch: float | None = None, max_action: float = 1.0) -> np.ndarray:
         m, d = self.env.model, self.env.data
@@ -113,6 +123,7 @@ class AnalyticTeacher:
             elif phase == Phase.LIFT:
                 self._lift_start = self.env._ee_pos()
                 self._lift_approach = approach.copy()
+                self._retract_start = None
         if phase in (Phase.NAVIGATE_TO_PICK, Phase.NAVIGATE_TO_PLACE):
             action[:2] = self._base_action()
             if phase == Phase.NAVIGATE_TO_PLACE:
@@ -141,6 +152,10 @@ class AnalyticTeacher:
                                          self.cfg["gripper_close_seconds"])
                 action[6] = 1.0 - 2.0 * close
         elif phase == Phase.LIFT:
+            if self.env._hold_active:
+                action[6] = -1.0
+                self._last = action.copy()
+                return action
             blend = self._smoothstep(self.env.fsm.phase_time / self.cfg["lift_seconds"])
             target = self._lift_start + np.array([0, 0, self.cfg["lift_height"] * blend])
             retract = self._smoothstep((self.env.fsm.phase_time - self.cfg["lift_seconds"]) /
